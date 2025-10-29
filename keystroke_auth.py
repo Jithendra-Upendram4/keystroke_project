@@ -20,7 +20,13 @@ import random
 import sys
 
 PROFILE_FILE = "profiles.json"
-PASSWORD = "secret"  # exact password for interactive capture
+# Default password used only for backward compatibility with older profiles
+DEFAULT_PASSWORD = "secret"
+
+# Note: interactive register will ask the user to choose a password; the global
+# DEFAULT_PASSWORD is used only when loading legacy profiles stored as feature
+# lists (no password saved).
+PASSWORD = DEFAULT_PASSWORD
 
 # Try to import pynput (may fail or be ineffective in some terminals)
 try:
@@ -53,7 +59,7 @@ def on_release(key):
         if key == keyboard.Key.enter:
             return False
 
-def record_keystrokes_pynput(prompt):
+def record_keystrokes_pynput(prompt, expected_password=None):
     """
     Use pynput listener to record press and release times.
     Blocks until Enter key release is detected.
@@ -63,7 +69,10 @@ def record_keystrokes_pynput(prompt):
     release_times = []
     pressed_sequence = []
     print(prompt)
-    print(f"Type the password then press Enter. Password must be exactly: '{PASSWORD}'")
+    if expected_password:
+        print(f"Type the password then press Enter. Password must be exactly: '{expected_password}'")
+    else:
+        print("Type the password then press Enter.")
     input("Press Enter to start recording in the background...")
     recording = True
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
@@ -88,7 +97,7 @@ try:
 except Exception:
     MSVCRT_AVAILABLE = False
 
-def record_keystrokes_fallback(prompt):
+def record_keystrokes_fallback(prompt, expected_password=None):
     """
     Terminal-friendly recorder that:
      - On Windows uses msvcrt.getwch() to capture real-time key presses in the terminal.
@@ -99,7 +108,10 @@ def record_keystrokes_fallback(prompt):
     print(prompt)
     print("FALLBACK MODE (terminal-friendly).")
     print("You can type the whole password continuously when prompted, then press Enter to finish.")
-    print(f"Password to enter: '{PASSWORD}'")
+    if expected_password:
+        print(f"Password to enter: '{expected_password}'")
+    else:
+        print("Password to enter: (any)")
     input("Press Enter to begin recording...")
 
     # --- Windows real-time capture using msvcrt ---
@@ -131,8 +143,8 @@ def record_keystrokes_fallback(prompt):
             # continue capturing until Enter
         # derive release times as press + dwell_estimate
         release_times_local = [t + dwell_estimate for t in press_times_local]
-        typed = "".join(pressed_chars)
-        return typed, press_times_local, release_times_local
+    typed = "".join(pressed_chars)
+    return typed, press_times_local, release_times_local
 
     # --- Non-Windows fallback: per-character Enter-based recording (reliable) ---
     print("msvcrt not available — using per-character Enter fallback.")
@@ -140,7 +152,9 @@ def record_keystrokes_fallback(prompt):
     pressed_chars = []
     input("Press Enter to begin the per-character recording...")
     prev = time.time()
-    for expected_char in PASSWORD:
+    # iterate over expected_password if provided, otherwise fall back to DEFAULT_PASSWORD
+    pw = expected_password if expected_password is not None else PASSWORD
+    for expected_char in pw:
         s = input(f"Type '{expected_char}' then press Enter: ")
         now = time.time()
         ch = s[0] if s else ''
@@ -154,29 +168,31 @@ def record_keystrokes_fallback(prompt):
     base = time.time()
     cumulative = base
     for interval in times:
+
         cumulative += interval
         press_times_local.append(cumulative)
         release_times_local.append(cumulative + dwell_estimate)
     typed = "".join(pressed_chars)
     return typed, press_times_local, release_times_local
 
-def extract_features(typed, press_times, release_times):
+def extract_features(typed, press_times, release_times, expected_password=None):
     """
     Returns a feature vector: [dwell_0...dwell_n, flight_1...flight_n]
     Dwell = release[i] - press[i]
     Flight = press[i] - press[i-1] (for i>=1)
     """
-    if typed != PASSWORD:
+    # If an expected_password is provided, ensure typed matches it
+    if expected_password is not None and typed != expected_password:
         return None
-    n = len(PASSWORD)
-    # Ensure we have at least n press and n release times; otherwise fail
-    if len(press_times) < n or len(release_times) < n:
+    pw_len = len(expected_password) if expected_password is not None else len(typed)
+    # Ensure we have at least pw_len press and release times; otherwise fail
+    if len(press_times) < pw_len or len(release_times) < pw_len:
         return None
-    dwell = [release_times[i] - press_times[i] for i in range(n)]
-    flight = [press_times[i] - press_times[i-1] for i in range(1, n)]
+    dwell = [release_times[i] - press_times[i] for i in range(pw_len)]
+    flight = [press_times[i] - press_times[i-1] for i in range(1, pw_len)]
     return dwell + flight
 
-def save_profile(name, features):
+def save_profile(name, password, features):
     data = {}
     if os.path.exists(PROFILE_FILE):
         with open(PROFILE_FILE, "r") as f:
@@ -184,7 +200,7 @@ def save_profile(name, features):
                 data = json.load(f)
             except Exception:
                 data = {}
-    data[name] = features
+    data[name] = {"password": password, "features": features}
     with open(PROFILE_FILE, "w") as f:
         json.dump(data, f)
 
@@ -193,9 +209,15 @@ def load_profile(name):
         return None
     with open(PROFILE_FILE, "r") as f:
         try:
-            return json.load(f).get(name)
+            raw = json.load(f).get(name)
         except Exception:
             return None
+    if raw is None:
+        return None
+    # Legacy support: if stored as plain features list, attach default password
+    if isinstance(raw, list):
+        return {"password": DEFAULT_PASSWORD, "features": raw}
+    return raw
 
 def compare_features(f1, f2):
     if f1 is None or f2 is None or len(f1) != len(f2):
@@ -222,22 +244,28 @@ def interactive_register(name):
     Chooses pynput or fallback automatically.
     """
     print(f"Registering profile '{name}' — will record 3 samples and average them.")
+    # Ask the user to choose a password for this profile
+    password = input("Choose a password to register (type it now): ")
+    confirm = input("Confirm password (type again): ")
+    if password != confirm:
+        print("Passwords do not match. Aborting.")
+        return False
     samples = []
     for i in range(3):
         print(f"Recording sample {i+1}/3")
         # Choose recorder
         if should_use_pynput():
-            typed, press, rel = record_keystrokes_pynput(f"Recording sample {i+1}/3")
+            typed, press, rel = record_keystrokes_pynput(f"Recording sample {i+1}/3", expected_password=password)
         else:
-            typed, press, rel = record_keystrokes_fallback(f"Recording sample {i+1}/3")
-        features = extract_features(typed, press, rel)
+            typed, press, rel = record_keystrokes_fallback(f"Recording sample {i+1}/3", expected_password=password)
+        features = extract_features(typed, press, rel, expected_password=password)
         if features is None:
             print("Typed text did not match password. Aborting registration.")
             return False
         samples.append(features)
         print(f"Captured sample {i+1}")
     avg = average_samples(samples)
-    save_profile(name, avg)
+    save_profile(name, password, avg)
     print("Saved averaged profile for", name)
     return True
 
@@ -246,16 +274,17 @@ def interactive_test(name, threshold=0.10):
     if stored is None:
         print("Profile not found.")
         return
+    expected_password = stored.get("password")
     # choose recorder
     if should_use_pynput():
-        typed, press, rel = record_keystrokes_pynput("Recording test pattern")
+        typed, press, rel = record_keystrokes_pynput("Recording test pattern", expected_password=expected_password)
     else:
-        typed, press, rel = record_keystrokes_fallback("Recording test pattern")
-    features = extract_features(typed, press, rel)
+        typed, press, rel = record_keystrokes_fallback("Recording test pattern", expected_password=expected_password)
+    features = extract_features(typed, press, rel, expected_password=expected_password)
     if features is None:
         print("Typed text did not match password. Try again.")
         return
-    score = compare_features(stored, features)
+    score = compare_features(stored.get("features"), features)
     print(f"Mean absolute feature difference = {score:.4f} seconds")
     if score <= threshold:
         print("✅ Access Granted")
@@ -269,7 +298,8 @@ def run_demo():
     base_profile = base_dwell + base_flight
     reg_samples = [jittered_sample_from_profile(base_profile, jitter=0.02) for _ in range(3)]
     avg_profile = average_samples(reg_samples)
-    save_profile("demo_user", avg_profile)
+    # Save demo profile with a demo password
+    save_profile("demo_user", "demo", avg_profile)
     print("Demo: saved averaged registration profile for 'demo_user'")
 
     genuine = jittered_sample_from_profile(avg_profile, jitter=0.02)
@@ -313,7 +343,7 @@ def main():
         run_demo()
         return
 
-    print("Keystroke Dynamics (Real) — password:", PASSWORD)
+    print("Keystroke Dynamics (Interactive)")
     mode = input("Choose: (r)egister or (t)est: ").lower()
     if mode == 'r':
         name = input("Enter profile name to register: ")
